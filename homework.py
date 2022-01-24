@@ -7,31 +7,33 @@ from logging import StreamHandler
 
 import requests
 from dotenv import load_dotenv
+from requests.exceptions import RequestException
 from telegram import Bot
 
 from exceptions import ServerError, WrongAPIAnswerError
 
 load_dotenv()
 
-FORMAT_CONSOLE = logging.Formatter(
+FORMAT = (
     '%(asctime)s - %(name)s - %(levelname)s - '
     '[%(filename)s:%(lineno)d] - %(funcName)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 console = StreamHandler(sys.stdout)
-console.setFormatter(FORMAT_CONSOLE)
+console.setFormatter(logging.Formatter(FORMAT))
 logger.addHandler(console)
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TOKENS_NAME = ['PRACTICUM_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_CHAT_ID']
 
 RETRY_TIME = 600
 ENDPOINT = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
 HEADERS = {'Authorization': f'OAuth {PRACTICUM_TOKEN}'}
 
-HOMEWORK_VERDICTS = {
+VERDICTS = {
     'approved': 'Работа проверена: ревьюеру всё понравилось. Ура!',
     'reviewing': 'Работа взята на проверку ревьюером.',
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
@@ -43,11 +45,13 @@ def send_message(bot, message):
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
         logger.info(f'Отправлено сообщение: "{message}"')
-    except Exception:
+        return True
+    except Exception as error:
         logger.error(
-            f'Ошибка отправки сообщения: "{message}".',
+            f'{error}! Ошибка отправки сообщения "{message}".',
             exc_info=True
         )
+        return False
 
 
 def get_api_answer(current_timestamp):
@@ -55,8 +59,11 @@ def get_api_answer(current_timestamp):
     params = {'from_date': current_timestamp}
     try:
         response = requests.get(ENDPOINT, headers=HEADERS, params=params)
-    except Exception as error:
-        logging.error(f'Сбой сети: {error}')
+    except RequestException as error:
+        raise RequestException(
+            f'Ошибка соединения - {error}. '
+            f'Параметры запроса {ENDPOINT}, {HEADERS}, {params}.'
+        )
     if response.status_code != HTTPStatus.OK:
         raise ServerError(
             f'Ошибка доступа к серверу. Код ошибки - {response.status_code}. '
@@ -64,9 +71,15 @@ def get_api_answer(current_timestamp):
         )
     answer = response.json()
     if 'error' in answer:
-        code = answer.get('error')['code']
-        message = answer.get('error')['message']
-        raise WrongAPIAnswerError(f'Код ошибки: {code}. {message}.')
+        raise WrongAPIAnswerError(
+            'Отказ API - "error": {}. Параметры запроса: {}, {}, {}.'.format(
+                answer['error'], ENDPOINT, HEADERS, params)
+        )
+    if 'code' in answer:
+        raise WrongAPIAnswerError(
+            'Отказ API - "code": {}. Параметры запроса: {}, {}, {}.'.format(
+                answer['code'], ENDPOINT, HEADERS, params)
+        )
     return answer
 
 
@@ -88,18 +101,20 @@ def parse_status(homework):
     """Извлекает статус конкретной домашней работы."""
     name = homework['homework_name']
     status = homework['status']
-    verdict = HOMEWORK_VERDICTS.get(status)
-    if status not in HOMEWORK_VERDICTS:
+    verdict = VERDICTS.get(status)
+    if status not in VERDICTS:
         raise ValueError(f'Неожиданный статус "{status}" домашней работы!')
-    return f'Изменился статус проверки работы "{name}". {verdict}'
+    return 'Изменился статус проверки работы "{}". {}'.format(
+           name, verdict)
 
 
 def check_tokens():
     """Проверяет доступность переменных окружения."""
-    for name in ['PRACTICUM_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_CHAT_ID']:
-        if globals()[name] is None:
-            logger.critical(f'Отсутствует необходимая переменная "{name}".')
-            return False
+    missing_tokens = [name for name in TOKENS_NAME if globals()[name] is None]
+    if len(missing_tokens) > 0:
+        logger.critical('Отсутствует необходимая переменная(ые) "{}".'.format(
+            ', '.join(missing_tokens)))
+        return False
     return True
 
 
@@ -118,8 +133,8 @@ def main():
             logger.info('Получен ответ от API.')
             homeworks = check_response(response)
             logger.info('Данные о домашних работах успешно извлечены.')
-            current_timestamp = (response.get('current_date')
-                                 or int(time.time()))
+            previous_message = ''
+            current_timestamp = response.get('current_date', int(time.time()))
             if homeworks:
                 message = parse_status(homeworks[0])
             else:
@@ -129,8 +144,8 @@ def main():
             message = f'Сбой в работе программы: {error}'
 
         finally:
-            if message != previous_message:
-                send_message(bot, message)
+            if (message and message != previous_message
+               and send_message(bot, message)):
                 previous_message = message
             time.sleep(RETRY_TIME)
 
@@ -139,10 +154,7 @@ if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
         filename=__file__ + '.log',
-        format=(
-            '%(asctime)s - %(name)s - %(levelname)s - '
-            '[%(filename)s:%(lineno)d] - %(funcName)s - %(message)s'
-        ),
+        format=FORMAT,
         filemode='w',
     )
     main()
