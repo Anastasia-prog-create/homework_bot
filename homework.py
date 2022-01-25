@@ -28,6 +28,7 @@ PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 TOKENS_NAME = ['PRACTICUM_TOKEN', 'TELEGRAM_TOKEN', 'TELEGRAM_CHAT_ID']
+MISTAKE_KEYS = ['error', 'code']
 
 RETRY_TIME = 600
 ENDPOINT = 'https://practicum.yandex.ru/api/user_api/homework_statuses/'
@@ -45,40 +46,36 @@ def send_message(bot, message):
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
         logger.info(f'Отправлено сообщение: "{message}"')
-        return True
     except Exception as error:
         logger.error(
             f'{error}! Ошибка отправки сообщения "{message}".',
             exc_info=True
         )
         return False
+    return True
 
 
-def get_api_answer(current_timestamp):
+def get_api_answer(timestamp):
     """Делает запрос к API, возвращает ответ в формате JSON."""
-    params = {'from_date': current_timestamp}
+    params = {'from_date': timestamp}
     try:
         response = requests.get(ENDPOINT, headers=HEADERS, params=params)
     except RequestException as error:
-        raise RequestException(
+        raise ConnectionError(
             f'Ошибка соединения - {error}. '
             f'Параметры запроса {ENDPOINT}, {HEADERS}, {params}.'
         )
     if response.status_code != HTTPStatus.OK:
         raise ServerError(
-            f'Ошибка доступа к серверу. Код ошибки - {response.status_code}. '
+            f'Ошибочный код возврата - {response.status_code}. '
             f'Параметры запроса {ENDPOINT}, {HEADERS}, {params}.'
         )
     answer = response.json()
-    if 'error' in answer:
+    mistakes = [mistake for mistake in MISTAKE_KEYS if mistake in answer]
+    if mistakes:
         raise WrongAPIAnswerError(
-            'Отказ API - "error": {}. Параметры запроса: {}, {}, {}.'.format(
-                answer['error'], ENDPOINT, HEADERS, params)
-        )
-    if 'code' in answer:
-        raise WrongAPIAnswerError(
-            'Отказ API - "code": {}. Параметры запроса: {}, {}, {}.'.format(
-                answer['code'], ENDPOINT, HEADERS, params)
+            f'Ошибка на сервере: {mistakes}. '
+            f'Параметры запроса: {ENDPOINT}, {HEADERS}, {params}.'
         )
     return answer
 
@@ -104,16 +101,14 @@ def parse_status(homework):
     verdict = VERDICTS.get(status)
     if status not in VERDICTS:
         raise ValueError(f'Неожиданный статус "{status}" домашней работы!')
-    return 'Изменился статус проверки работы "{}". {}'.format(
-           name, verdict)
+    return f'Изменился статус проверки работы "{name}". {verdict}'
 
 
 def check_tokens():
     """Проверяет доступность переменных окружения."""
     missing_tokens = [name for name in TOKENS_NAME if globals()[name] is None]
-    if len(missing_tokens) > 0:
-        logger.critical('Отсутствует необходимая переменная(ые) "{}".'.format(
-            ', '.join(missing_tokens)))
+    if missing_tokens:
+        logger.critical(f'Отсутствуют необходимые токены "{missing_tokens}".')
         return False
     return True
 
@@ -125,16 +120,17 @@ def main():
     logger.info('Аутентификационные данные получены.')
 
     bot = Bot(token=TELEGRAM_TOKEN)
-    current_timestamp = int(time.time())
+    timestamp = int(time.time())
     previous_message = ''
     while True:
         try:
-            response = get_api_answer(current_timestamp)
+            message = ''
+            response = get_api_answer(timestamp)
             logger.info('Получен ответ от API.')
             homeworks = check_response(response)
             logger.info('Данные о домашних работах успешно извлечены.')
             previous_message = ''
-            current_timestamp = response.get('current_date', int(time.time()))
+            timestamp = response.get('current_date', timestamp)
             if homeworks:
                 message = parse_status(homeworks[0])
             else:
@@ -144,8 +140,8 @@ def main():
             message = f'Сбой в работе программы: {error}'
 
         finally:
-            if (message and message != previous_message
-               and send_message(bot, message)):
+            if (message and message != previous_message and send_message(
+                    bot, message)):
                 previous_message = message
             time.sleep(RETRY_TIME)
 
